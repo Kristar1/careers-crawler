@@ -1,0 +1,47 @@
+name: Check careers pages (daily)
+on:
+  schedule:
+    - cron: "30 0 * * *"     # 6:00 AM IST, before the sheet's 7 AM run
+  workflow_dispatch:
+    inputs:
+      daily_sites:
+        description: "How many company sites to check (use 500 for a quick test)"
+        default: "60000"
+permissions:
+  contents: read
+concurrency: careers-daily
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install aiohttp aiodns requests
+      # Pool and crawler memory live in the repo's private workflow cache (only workflows can read it).
+      - name: Restore pool
+        uses: actions/cache/restore@v4
+        with:
+          path: pool.csv.gz
+          key: pool-none
+          restore-keys: pool-
+      - name: Restore crawler memory
+        uses: actions/cache/restore@v4
+        with:
+          path: state.db
+          key: state-none
+          restore-keys: state-
+      - run: python rotate.py
+        env:
+          DAILY_SITES: ${{ github.event.inputs.daily_sites || '60000' }}
+          TIME_BUDGET_MIN: "240"
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+          SHEET_TOKEN: ${{ secrets.SHEET_TOKEN }}
+      - name: Save crawler memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.db
+          key: state-${{ github.run_id }}
