@@ -82,15 +82,14 @@ def shard(index, total):
                 print(f"  [{n}/{len(files)}] attempt {attempt + 1} failed: {e}")
                 time.sleep(30 * (attempt + 1))
     os.makedirs("out", exist_ok=True)
-    con.execute("COPY (SELECT DISTINCT * FROM pages) TO 'out/shard.csv.gz' (FORMAT CSV, HEADER, COMPRESSION GZIP)")
+    con.execute("COPY (SELECT DISTINCT * FROM pages) TO 'out/shard.parquet' (FORMAT PARQUET)")
     with open("out/crawl.txt", "w") as fh:
         fh.write(crawl)
 
 
 def merge():
     con = connect()
-    con.execute("""CREATE TABLE pages AS SELECT DISTINCT * FROM read_csv('shards/**/shard.csv.gz', header = true,
-                   columns = {'domain': 'VARCHAR', 'host': 'VARCHAR', 'path': 'VARCHAR'})""")
+    con.execute("CREATE TABLE pages AS SELECT DISTINCT domain, host, path FROM read_parquet('shards/**/shard.parquet')")
     excl = " OR ".join(f"domain LIKE '{w}.%' OR domain LIKE '%.{w}.%'" for w in EXCLUDE)
     con.execute(f"""DELETE FROM pages WHERE domain IS NULL OR host IS NULL
                     OR regexp_matches(domain, '\\.(edu|gov|mil|ac\\.[a-z]+|gov\\.[a-z]+)$') OR {excl}""")
@@ -110,7 +109,7 @@ def merge():
     full_scan = os.environ.get("FULL_SCAN", "0") == "1"
     if os.path.exists("prev_pool.csv.gz"):
         con.execute("""CREATE TABLE prev AS SELECT domain, careers_url, job_pages, pages_hash, mined
-                       FROM read_csv('prev_pool.csv.gz', header = true, all_varchar = true)""")
+                       FROM read_csv('prev_pool.csv.gz', header = true, all_varchar = true, quote = '"', escape = '"')""")
         # "changed" is only reliable when the whole index was scanned (a partial slice sees only some pages)
         changed = "CASE WHEN p.pages_hash IS NOT NULL AND p.pages_hash <> n.pages_hash THEN 1 ELSE 0 END" if full_scan else "0"
         con.execute(f"""CREATE TABLE out AS
