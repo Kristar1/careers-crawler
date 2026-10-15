@@ -1,0 +1,66 @@
+name: Mine Common Crawl (monthly)
+on:
+  schedule:
+    - cron: "0 2 5 * *"      # 5th of every month, 7:30 AM IST
+  workflow_dispatch:
+    inputs:
+      files_limit:
+        description: "Index files per shard (0 = whole index). Use 1 for a quick test run."
+        default: "0"
+permissions:
+  contents: read
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install duckdb requests
+      - run: python cc_miner.py shard --index ${{ matrix.shard }} --total 20
+        env:
+          CC_FILES_LIMIT: ${{ github.event.inputs.files_limit || '0' }}
+          CC_ROTATE: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/
+          retention-days: 1
+  merge:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install duckdb requests
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      # The pool lives in the repo's private workflow cache, not in the public repo.
+      - name: Previous pool
+        uses: actions/cache/restore@v4
+        with:
+          path: pool.csv.gz
+          key: pool-none
+          restore-keys: pool-
+      - run: if [ -f pool.csv.gz ]; then mv pool.csv.gz prev_pool.csv.gz; fi
+      - run: python cc_miner.py merge
+        env:
+          FULL_SCAN: ${{ (github.event.inputs.files_limit || '0') == '0' && '1' || '0' }}
+      - name: Save pool
+        uses: actions/cache/save@v4
+        with:
+          path: pool.csv.gz
+          key: pool-${{ github.run_id }}
