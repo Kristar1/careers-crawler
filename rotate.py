@@ -20,9 +20,9 @@ import requests
 
 POOL_FILE, STATE_FILE = "pool.csv.gz", "state.db"
 DAILY_SITES = int(os.environ.get("DAILY_SITES", "60000"))
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "150"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "300"))
 MAX_OPEN_JOBS = int(os.environ.get("MAX_OPEN_JOBS", "15"))
-MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "14"))
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "3"))   # only roles posted (or first seen) in the last N days
 MAX_NEW_PER_SITE = 5
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET_MIN", "240")) * 60
 SHEET_WEBHOOK, SHEET_TOKEN = os.environ.get("SHEET_WEBHOOK_URL"), os.environ.get("SHEET_TOKEN", "")
@@ -160,12 +160,18 @@ def open_db():
 
 
 def pick_sites(db, n):
-    q = """SELECT p.domain, p.careers_url, s.links, s.seen, s.robots_ok, s.robots_checked
+    # Order: (0) companies with new job pages this month, (1) working careers pages due for a
+    # revisit (checked 2+ days ago) so new roles are caught within ~3 days, (2) never-checked
+    # sites, (3) everything else. Pages that failed are retried only every 14 days.
+    q = """SELECT p.domain, p.careers_url, s.links, s.seen, s.robots_ok, s.robots_checked, s.last_checked
            FROM pool p LEFT JOIN sites s ON s.domain = p.domain
-           WHERE s.status IS NULL OR s.status NOT IN ('big', 'ats', 'robots')
-                 OR s.last_checked < date('now', '-90 day')
+           WHERE (s.status IS NULL OR s.status NOT IN ('big', 'ats', 'robots', 'fail')
+                  OR s.last_checked < date('now', '-90 day')
+                  OR (s.status = 'fail' AND s.last_checked < date('now', '-14 day')))
+             AND (s.last_checked IS NULL OR s.last_checked < date('now'))
            ORDER BY CASE WHEN p.changed = 1 AND (s.last_checked IS NULL OR s.last_checked < p.mined) THEN 0
-                         WHEN s.last_checked IS NULL THEN 1 ELSE 2 END,
+                         WHEN s.status = 'ok' AND s.last_checked <= date('now', '-2 day') THEN 1
+                         WHEN s.last_checked IS NULL THEN 2 ELSE 3 END,
                     s.last_checked ASC
            LIMIT ?"""
     return db.execute(q, (n,)).fetchall()
@@ -201,17 +207,17 @@ async def check_site(session, sem, row):
     except Exception as e:   # one broken page must never stop the whole run
         return {"domain": row[0], "url": row[1], "status": "fail", "robots_ok": int(bool(row[4])),
                 "robots_checked": row[5], "prev_links": json.loads(row[2]) if row[2] else None,
-                "seen": set(json.loads(row[3])) if row[3] else set()}
+                "seen": set(json.loads(row[3])) if row[3] else set(), "prev_checked": row[6]}
 
 
 async def _check_site(session, sem, row):
-    domain, url, links_json, seen_json, robots_ok, robots_checked = row
+    domain, url, links_json, seen_json, robots_ok, robots_checked, prev_checked = row
     async with sem:
         ok, refreshed = await robots_allowed(session, url, robots_ok, robots_checked)
         res = {"domain": domain, "url": url, "robots_ok": int(ok),
                "robots_checked": TODAY if refreshed else robots_checked,
                "prev_links": json.loads(links_json) if links_json else None,
-               "seen": set(json.loads(seen_json)) if seen_json else set()}
+               "seen": set(json.loads(seen_json)) if seen_json else set(), "prev_checked": prev_checked}
         if not ok:
             res["status"] = "robots"
             return res
@@ -284,7 +290,7 @@ async def main():
         db.execute("INSERT INTO meta VALUES ('ats_resent_v1', ?)", (TODAY,))
         db.commit()
 
-    timeout = aiohttp.ClientTimeout(total=20, connect=8)
+    timeout = aiohttp.ClientTimeout(total=12, connect=6)
     conn = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=2, ttl_dns_cache=600, ssl=False)
     sem = asyncio.Semaphore(CONCURRENCY)
     boards, cands = set(), []
@@ -324,6 +330,8 @@ async def main():
                                           "title": title, "text": strip_tags(str(p.get("description", ""))),
                                           "posted": p.get("datePosted", ""), "jobSchema": True})
                         # plain pages: new job links since the last visit
+                        recent_visit = bool(res.get("prev_checked")) and res["prev_checked"] >= (
+                            datetime.date.today() - datetime.timedelta(days=MAX_AGE_DAYS)).isoformat()
                         if res["prev_links"] is None:
                             stats["baseline"] += 1
                         else:
@@ -333,7 +341,8 @@ async def main():
                                     seen.add(u)
                                     detail_needed.append({"key": "cp:" + u, "url": u, "source": "careers-page",
                                                           "company": company_from(d), "title": links[u],
-                                                          "text": "", "posted": "", "jobSchema": False})
+                                                          "text": "", "posted": "", "jobSchema": False,
+                                                          "_recent_visit": recent_visit})
                     stats[status] = stats.get(status, 0) + (1 if status in ("ats", "big") else 0)
                 keep_links = list(links)[:300] if status == "ok" else (res["prev_links"] or [])
                 db.execute("""INSERT INTO sites (domain, last_checked, links, seen, ats, status, robots_ok, robots_checked)
@@ -344,7 +353,16 @@ async def main():
                            (d, TODAY, json.dumps(keep_links), json.dumps(sorted(seen)[-500:]),
                             json.dumps(res.get("boards") or []), status, res["robots_ok"], res["robots_checked"]))
             if detail_needed:
-                cands += await asyncio.gather(*(fetch_detail(session, sem, c) for c in detail_needed))
+                for c in await asyncio.gather(*(fetch_detail(session, sem, c) for c in detail_needed)):
+                    # keep only roles we can show are from the last MAX_AGE_DAYS days: a dated posting
+                    # that is recent, or an undated one that appeared since a visit within that window
+                    dated_ok = bool(c.get("posted")) and fresh(c["posted"])
+                    undated_ok = not c.get("posted") and c.pop("_recent_visit", False)
+                    c.pop("_recent_visit", None)
+                    if dated_ok or undated_ok:
+                        cands.append(c)
+                    else:
+                        stats["too_old"] = stats.get("too_old", 0) + 1
             db.commit()
             print(f"  {min(start + 2000, len(rows))}/{len(rows)} checked | {stats} | {len(cands)} leads, {len(boards)} boards")
             # send this batch's results now, so a later failure never loses them
