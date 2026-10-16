@@ -1,7 +1,7 @@
 name: Check careers pages (daily)
 on:
   schedule:
-    - cron: "30 0 * * *"     # 6:00 AM IST, before the sheet's 7 AM run
+    - cron: "30 0,8,16 * * *"   # 3 times a day (6 AM, 2 PM, 10 PM IST) so pages are revisited within ~3 days
   workflow_dispatch:
     inputs:
       daily_sites:
