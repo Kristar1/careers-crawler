@@ -118,8 +118,11 @@ def job_links(page_url, page):
         href = html.unescape(href).strip()
         if href.lower().startswith(("mailto:", "tel:", "javascript:")):
             continue
-        absu = urljoin(page_url, href).split("#")[0]
-        if reg_domain(absu) != base or not JOB_PATH.search(urlparse(absu).path):
+        try:
+            absu = urljoin(page_url, href).split("#")[0]
+            if reg_domain(absu) != base or not JOB_PATH.search(urlparse(absu).path):
+                continue
+        except ValueError:   # malformed link on the page
             continue
         if absu.rstrip("/") == page_url.rstrip("/"):
             continue
@@ -193,6 +196,15 @@ async def robots_allowed(session, url, cached_ok, checked):
 
 
 async def check_site(session, sem, row):
+    try:
+        return await _check_site(session, sem, row)
+    except Exception as e:   # one broken page must never stop the whole run
+        return {"domain": row[0], "url": row[1], "status": "fail", "robots_ok": int(bool(row[4])),
+                "robots_checked": row[5], "prev_links": json.loads(row[2]) if row[2] else None,
+                "seen": set(json.loads(row[3])) if row[3] else set()}
+
+
+async def _check_site(session, sem, row):
     domain, url, links_json, seen_json, robots_ok, robots_checked = row
     async with sem:
         ok, refreshed = await robots_allowed(session, url, robots_ok, robots_checked)
@@ -213,8 +225,11 @@ async def check_site(session, sem, row):
 
 
 async def fetch_detail(session, sem, cand):
-    async with sem:
-        page, final = await fetch(session, cand["url"])
+    try:
+        async with sem:
+            page, final = await fetch(session, cand["url"])
+    except Exception:
+        return cand
     if page:
         posts = job_postings(page)
         if posts:
