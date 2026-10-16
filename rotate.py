@@ -273,12 +273,23 @@ async def main():
     db = open_db()
     rows = pick_sites(db, DAILY_SITES)
     print(f"Pool loaded. Checking {len(rows)} sites today.")
+    db.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    if not db.execute("SELECT 1 FROM meta WHERE k = 'ats_resent_v1'").fetchone():
+        old = set()
+        for (ats_json,) in db.execute("SELECT ats FROM sites WHERE ats IS NOT NULL AND ats <> '[]'"):
+            old.update(tuple(b) for b in json.loads(ats_json))
+        if old:
+            print(f"Re-sending {len(old)} job boards found in earlier runs.")
+            send_in_batches([], [list(b) for b in sorted(old)])
+        db.execute("INSERT INTO meta VALUES ('ats_resent_v1', ?)", (TODAY,))
+        db.commit()
 
     timeout = aiohttp.ClientTimeout(total=20, connect=8)
     conn = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=2, ttl_dns_cache=600, ssl=False)
     sem = asyncio.Semaphore(CONCURRENCY)
     boards, cands = set(), []
     stats = {"ok": 0, "fail": 0, "robots": 0, "big": 0, "ats": 0, "baseline": 0}
+    sent_leads = sent_boards = 0
 
     async with aiohttp.ClientSession(timeout=timeout, connector=conn, headers={"User-Agent": UA}) as session:
         for start in range(0, len(rows), 2000):
@@ -336,14 +347,16 @@ async def main():
                 cands += await asyncio.gather(*(fetch_detail(session, sem, c) for c in detail_needed))
             db.commit()
             print(f"  {min(start + 2000, len(rows))}/{len(rows)} checked | {stats} | {len(cands)} leads, {len(boards)} boards")
+            # send this batch's results now, so a later failure never loses them
+            send_in_batches([c for c in cands if len(c.get("text") or "") >= 150], [list(b) for b in sorted(boards)])
+            sent_leads += len(cands); sent_boards += len(boards)
+            boards, cands = set(), []
 
     db.execute("DROP TABLE pool")
     db.commit()
     db.execute("VACUUM")
     db.close()
-    cands = [c for c in cands if len(c.get("text") or "") >= 150]
-    print(f"Done in {(time.time() - t0) / 60:.0f} min. Sending {len(cands)} leads and {len(boards)} job boards to the sheet.")
-    send_in_batches(cands, [list(b) for b in sorted(boards)])
+    print(f"Done in {(time.time() - t0) / 60:.0f} min. Sent {sent_leads} leads and {sent_boards} job boards to the sheet.")
 
 
 if __name__ == "__main__":
